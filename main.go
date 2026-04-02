@@ -1,3 +1,4 @@
+// go build -o mplayer.exe -ldflags "-s -w -H=windowsgui" 2>&1
 package main
 
 import (
