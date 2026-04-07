@@ -1,0 +1,19 @@
+# IDE and editor configs
+.clinerules/
+.vscode/
+.qwen/
+
+# Build artifacts
+mplayer.exe
+mplayer
+
+# Go dependencies
+go.mod
+go.sum
+
+# Temporary files
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
