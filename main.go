@@ -620,7 +620,7 @@ func (p *Player) Seek(pos float64) {
 
 	wasPlaying := p.isPlaying
 
-	// Stop current playback
+	// Stop current playback - pause to allow seek
 	if p.ctrl != nil {
 		p.ctrl.Paused = true
 	}
@@ -649,18 +649,16 @@ func (p *Player) Seek(pos float64) {
 
 	// Update UI
 	if p.progressBar != nil {
-		fyne.Do(func() {
-			p.progressBar.Value = pos
-			p.progressBar.Refresh()
-			p.updateTimeDisplay(currentSeconds, duration)
-		})
+		p.progressBar.Value = pos
+		p.progressBar.Refresh()
+		p.updateTimeDisplay(currentSeconds, duration)
 	} else {
 		p.updateTimeDisplay(currentSeconds, duration)
 	}
 
 	// If was playing - restart from new position
+	// Pause the controller during seek, then resume from new position
 	if wasPlaying {
-		// Recreate streamer -> ctrl -> volume chain for correct operation
 		p.ctrl = &beep.Ctrl{Streamer: p.streamer, Paused: false}
 		p.volumeStreamer = &effects.Volume{
 			Streamer: p.ctrl,
