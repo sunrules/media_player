@@ -189,9 +189,9 @@ type Player struct {
 	progressActive bool
 
 	// File
-	filePath     string
-	fileFormat   string
-	fileSize     int64
+	filePath   string
+	fileFormat string
+	fileSize   int64
 
 	// Playlist
 	playlist *Playlist
@@ -262,6 +262,11 @@ func (p *Player) Load(path string) error {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 
+	// Get file size (Stat must happen before Close)
+	if fi, err := file.Stat(); err == nil {
+		p.fileSize = fi.Size()
+	}
+
 	// Determine format and create decoder
 	ext := getFileExtension(path)
 	var streamer beep.StreamSeeker
@@ -305,7 +310,14 @@ func (p *Player) Load(path string) error {
 			debugPrintErr(err, "Error decoding WAV")
 			return fmt.Errorf("error decoding WAV: %w", err)
 		}
-		streamer = s
+		buf := beep.NewBuffer(f)
+		buf.Append(s)
+		decErr := s.Err()
+		s.Close() // closes file
+		if decErr != nil {
+			return fmt.Errorf("error reading WAV: %w", decErr)
+		}
+		streamer = buf.Streamer(0, buf.Len())
 		format = f
 
 	default:
@@ -327,12 +339,6 @@ func (p *Player) Load(path string) error {
 		}
 		p.speakerInited = true
 		p.sampleRate = format.SampleRate
-	}
-
-	// Get file size
-	fileInfo, err := file.Stat()
-	if err == nil {
-		p.fileSize = fileInfo.Size()
 	}
 
 	// Save state
@@ -618,58 +624,28 @@ func (p *Player) Seek(pos float64) {
 		return
 	}
 
-	wasPlaying := p.isPlaying
+	target := int(pos * float64(p.totalSamples))
 
-	// Stop current playback - pause to allow seek
-	if p.ctrl != nil {
-		p.ctrl.Paused = true
-	}
-
-	// Calculate target position in samples
-	targetSample := int(pos * float64(p.totalSamples))
-	debugPrintf("Target position: %d samples out of %d", targetSample, p.totalSamples)
-
-	// Seek
-	err := p.streamer.Seek(targetSample)
+	speaker.Lock()
+	err := p.streamer.Seek(target)
+	speaker.Unlock()
 	if err != nil {
 		debugPrintErr(err, "Seek error")
 		return
 	}
 
-	// Update elapsedAtPause
 	duration := p.sampleRate.D(p.totalSamples).Seconds()
-	if duration > 0 {
-		p.elapsedAtPause = time.Duration(pos * duration * float64(time.Second))
-	} else {
-		p.elapsedAtPause = 0
+	p.elapsedAtPause = time.Duration(pos * duration * float64(time.Second))
+	if p.isPlaying {
+		p.startTime = time.Now()
 	}
 
 	currentSeconds := pos * duration
-	debugPrintf("Current time: %.2f seconds", currentSeconds)
-
-	// Update UI
 	if p.progressBar != nil {
 		p.progressBar.Value = pos
 		p.progressBar.Refresh()
-		p.updateTimeDisplay(currentSeconds, duration)
-	} else {
-		p.updateTimeDisplay(currentSeconds, duration)
 	}
-
-	// If was playing - restart from new position
-	// Pause the controller during seek, then resume from new position
-	if wasPlaying {
-		p.ctrl = &beep.Ctrl{Streamer: p.streamer, Paused: false}
-		p.volumeStreamer = &effects.Volume{
-			Streamer: p.ctrl,
-			Base:     2,
-			Volume:   -5 + p.volume*5,
-			Silent:   p.volume <= 0,
-		}
-		speaker.Play(p.volumeStreamer)
-		p.isPlaying = true
-		p.startTime = time.Now()
-	}
+	p.updateTimeDisplay(currentSeconds, duration)
 }
 
 func showHelp() {
