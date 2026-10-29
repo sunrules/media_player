@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -858,6 +859,191 @@ Commands:
 	}
 }
 
+// ---------- Пользовательский диалог открытия файлов ----------
+
+const entryPC = "💻 Мой компьютер" // спецзапись: переход к списку дисков
+
+type browseEntry struct {
+	isDir bool
+	name  string
+	path  string // готовый путь для спецзаписей (диск, «Домой»)
+	toPC  bool   // переход к списку дисков
+}
+
+type browseState struct {
+	dir      string
+	items    []browseEntry
+	selected int
+}
+
+var lastOpenDir = "" // запоминаем последнюю папку между запусками диалога
+
+func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
+	a := fyne.CurrentApp()
+	w := a.NewWindow("Открыть аудиофайл")
+	w.Resize(fyne.NewSize(760, 540)) // начальный размер, окно можно растянуть
+	w.CenterOnScreen()
+
+	startDir := lastOpenDir
+	if startDir == "" {
+		if d, err := os.UserHomeDir(); err == nil {
+			startDir = d
+		} else {
+			startDir = "."
+		}
+	}
+
+	st := &browseState{dir: startDir, selected: -1}
+
+	pathLabel := widget.NewLabel(displayBrowseDir(st.dir))
+	statusLabel := widget.NewLabel("") // здесь виден ПОЛНЫЙ путь — длинные имена не теряются
+
+	list := widget.NewList(
+		func() int { return len(st.items) },
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			e := st.items[id]
+			l := obj.(*widget.Label)
+			if e.isDir {
+				l.TextStyle = fyne.TextStyle{Bold: true} // папки — жирным
+			} else {
+				l.TextStyle = fyne.TextStyle{}
+			}
+			l.SetText(e.name)
+		},
+	)
+
+	openBtn := widget.NewButton("Открыть", func() {
+		if st.selected < 0 || st.selected >= len(st.items) || st.items[st.selected].isDir {
+			return
+		}
+		path := filepath.Join(st.dir, st.items[st.selected].name)
+		lastOpenDir = st.dir
+		w.Close()
+		onConfirm(path)
+	})
+	openBtn.Disable()
+
+	upBtn := widget.NewButton("⬆ Вверх", func() {
+		if st.dir == "" { // уже на списке дисков — выше некуда
+			return
+		}
+		parentDir := filepath.Dir(st.dir)
+		if parentDir != st.dir {
+			st.dir = parentDir
+		} else {
+			st.dir = "" // с корня диска поднимаемся к списку дисков
+		}
+		pathLabel.SetText(displayBrowseDir(st.dir))
+		loadBrowseDir(list, st)
+	})
+	cancelBtn := widget.NewButton("Отмена", func() { w.Close() })
+
+	list.OnSelected = func(id widget.ListItemID) {
+		if id >= len(st.items) {
+			return
+		}
+		e := st.items[id]
+		var full string
+		switch {
+		case e.toPC:
+			full = "" // список дисков
+		case e.path != "":
+			full = e.path
+		default:
+			full = filepath.Join(st.dir, e.name)
+		}
+		statusLabel.SetText(displayBrowseDir(full)) // полное имя всегда видно внизу
+		st.selected = int(id)
+
+		if e.isDir {
+			openBtn.Disable()
+			st.dir = full
+			pathLabel.SetText(displayBrowseDir(st.dir))
+			loadBrowseDir(list, st)
+			return
+		}
+		openBtn.Enable()
+	}
+
+	toolbar := container.NewHBox(upBtn, openBtn, cancelBtn)
+	content := container.NewBorder(
+		container.NewVBox(pathLabel, toolbar), // верх
+		statusLabel,                           // низ: полный путь
+		nil, nil, list,
+	)
+	w.SetContent(content)
+
+	loadBrowseDir(list, st)
+	w.Show() // ShowAndRun вызывать нельзя — он заблокирует основной цикл главного окна
+}
+
+func displayBrowseDir(dir string) string {
+	if dir == "" {
+		return entryPC
+	}
+	return dir
+}
+
+// browseDrives — содержимое экрана «Мой компьютер»: диски и домашняя папка
+func browseDrives() []browseEntry {
+	var items []browseEntry
+	if home, err := os.UserHomeDir(); err == nil {
+		items = append(items, browseEntry{isDir: true, name: "⌂ Домой", path: home})
+	}
+	hasDrive := false
+	for c := 'A'; c <= 'Z'; c++ {
+		drivePath := fmt.Sprintf("%c:\\", c)
+		if info, err := os.Stat(drivePath); err == nil && info.IsDir() {
+			items = append(items, browseEntry{isDir: true, name: string(c) + ":", path: drivePath})
+			hasDrive = true
+		}
+	}
+	if !hasDrive { // не Windows — просто корень файловой системы
+		items = append(items, browseEntry{isDir: true, name: "/", path: "/"})
+	}
+	return items
+}
+
+func loadBrowseDir(list *widget.List, st *browseState) {
+	var newItems []browseEntry
+	if st.dir == "" {
+		newItems = browseDrives()
+	} else {
+		entries, err := os.ReadDir(st.dir)
+		if err == nil {
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
+				if e.IsDir() {
+					newItems = append(newItems, browseEntry{isDir: true, name: e.Name()})
+				} else {
+					ext := strings.ToLower(filepath.Ext(e.Name()))
+					if ext == ".mp3" || ext == ".flac" || ext == ".ogg" || ext == ".wav" {
+						newItems = append(newItems, browseEntry{name: e.Name()})
+					}
+				}
+			}
+			sort.SliceStable(newItems, func(i, j int) bool {
+				if newItems[i].isDir != newItems[j].isDir {
+					return newItems[i].isDir // сначала папки
+				}
+				return strings.ToLower(newItems[i].name) < strings.ToLower(newItems[j].name)
+			})
+		}
+		newItems = append([]browseEntry{{isDir: true, name: entryPC, toPC: true}}, newItems...)
+	}
+	st.items = newItems
+	st.selected = -1
+	list.UnselectAll()
+	list.Refresh()
+}
+
+// ---------- Конец диалога ----------
+
 func main() {
 	flag.Parse()
 
@@ -934,33 +1120,16 @@ func main() {
 
 	openBtn := widget.NewButton("Open Audio File", func() {
 		debugPrintf("Open Audio File button clicked")
-		dialog.ShowFileOpen(func(r fyne.URIReadCloser, err error) {
-			if err != nil || r == nil {
-				debugPrintErr(err, "File open canceled or error")
-				return
-			}
-			defer r.Close()
-
-			path := r.URI().Path()
+		showFileOpenDialog(w, func(path string) {
 			debugPrintf("Selected file: %s", path)
-
-			loadingDialog := dialog.NewInformation("Loading", "Loading audio file...", w)
-			loadingDialog.Show()
-
 			go func() {
 				if err := player.Load(path); err != nil {
-					fyne.Do(func() {
-						loadingDialog.Hide()
-						dialog.ShowError(err, w)
-					})
+					fyne.Do(func() { dialog.ShowError(err, w) })
 				} else {
-					fyne.Do(func() {
-						loadingDialog.Hide()
-						player.Play()
-					})
+					player.Play()
 				}
 			}()
-		}, w)
+		})
 	})
 
 	volumeLabel := widget.NewLabel("Volume:")
