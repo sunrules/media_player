@@ -1,9 +1,12 @@
 // go build -o mplayer.exe -ldflags "-s -w -H=windowsgui" 2>&1
+// go build -tiny -o mplayer.exe -ldflags "-s -w -H=windowsgui"  2>&1
+// upx.exe --best .\mplayer.exe
 package main
 
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,9 +16,14 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"image"
+	"image/color"
 
 	"github.com/eiannone/keyboard"
 	"github.com/faiface/beep"
@@ -103,6 +111,15 @@ func (pl *Playlist) Prev() string {
 	return pl.files[pl.index]
 }
 
+// Files returns a copy of the playlist files
+func (pl *Playlist) Files() []string {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	out := make([]string, len(pl.files))
+	copy(out, pl.files)
+	return out
+}
+
 // Len returns the number of files
 func (pl *Playlist) Len() int {
 	pl.mu.Lock()
@@ -175,6 +192,10 @@ type Player struct {
 	volumeStreamer *effects.Volume
 
 	// UI elements
+	trackLabel       *widget.Label
+	statusLabel      *widget.Label
+	volumeValueLabel *widget.Label
+	visualizer       *canvas.Raster
 	volumeSlider     *widget.Slider
 	progressBar      *widget.Slider
 	currentTimeLabel *widget.Label
@@ -359,6 +380,12 @@ func (p *Player) Load(path string) error {
 	p.elapsedAtPause = 0
 
 	// Update UI
+	if p.trackLabel != nil {
+		fyne.Do(func() { p.trackLabel.SetText(filepath.Base(path)) })
+	}
+	if p.statusLabel != nil {
+		fyne.Do(func() { p.statusLabel.SetText("Stopped") })
+	}
 	if p.progressBar != nil {
 		fyne.Do(func() {
 			p.progressBar.Value = 0
@@ -418,6 +445,10 @@ func (p *Player) Pause() {
 	p.ctrl.Paused = true
 	p.isPlaying = false
 
+	if p.statusLabel != nil {
+		fyne.Do(func() { p.statusLabel.SetText("Paused") })
+	}
+
 	// Stop progress updates
 	if p.stopProgress != nil {
 		select {
@@ -453,6 +484,9 @@ func (p *Player) Stop() {
 	} else {
 		p.updateTimeDisplay(0, duration)
 	}
+	if p.statusLabel != nil {
+		fyne.Do(func() { p.statusLabel.SetText("Stopped") })
+	}
 }
 
 // Play starts playback
@@ -487,6 +521,11 @@ func (p *Player) Play() {
 
 	p.isPlaying = true
 	p.startTime = time.Now()
+
+	// Update UI status
+	if p.statusLabel != nil {
+		fyne.Do(func() { p.statusLabel.SetText("Playing") })
+	}
 
 	// Start progress updates
 	if !p.progressActive {
@@ -1044,6 +1083,172 @@ func loadBrowseDir(list *widget.List, st *browseState) {
 
 // ---------- Конец диалога ----------
 
+// spectrumWidget - simple animated spectrum visualizer in Winamp style
+type spectrumWidget struct {
+	widget.BaseWidget
+	bars  []float64
+	mu    sync.Mutex
+	color color.Color
+}
+
+func newSpectrumWidget(bars int) *spectrumWidget {
+	s := &spectrumWidget{
+		bars:  make([]float64, bars),
+		color: color.RGBA{R: 0x00, G: 0xFF, B: 0x66, A: 0xFF},
+	}
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+type spectrumRenderer struct {
+	widget *spectrumWidget
+	rects  []*canvas.Rectangle
+}
+
+func (s *spectrumWidget) CreateRenderer() fyne.WidgetRenderer {
+	r := &spectrumRenderer{widget: s, rects: make([]*canvas.Rectangle, len(s.bars))}
+	for i := range r.rects {
+		r.rects[i] = canvas.NewRectangle(s.color)
+	}
+	return r
+}
+
+func (r *spectrumRenderer) Layout(size fyne.Size) {
+	n := len(r.rects)
+	if n == 0 {
+		return
+	}
+	r.widget.mu.Lock()
+	bars := make([]float64, len(r.widget.bars))
+	copy(bars, r.widget.bars)
+	r.widget.mu.Unlock()
+
+	barW := size.Width / float32(n)
+	gap := float32(2)
+	for i, rect := range r.rects {
+		x := float32(i) * barW
+		h := float32(bars[i]) * size.Height
+		if h < 2 {
+			h = 2
+		}
+		rect.Move(fyne.NewPos(x, size.Height-h))
+		rect.Resize(fyne.NewSize(barW-gap, h))
+	}
+}
+
+func (r *spectrumRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(100, 60)
+}
+
+func (r *spectrumRenderer) Refresh() {
+	r.widget.mu.Lock()
+	defer r.widget.mu.Unlock()
+	for _, rect := range r.rects {
+		rect.FillColor = r.widget.color
+		canvas.Refresh(rect)
+	}
+	canvas.Refresh(r.widget)
+}
+
+func (r *spectrumRenderer) Objects() []fyne.CanvasObject {
+	objs := make([]fyne.CanvasObject, len(r.rects))
+	for i, rct := range r.rects {
+		objs[i] = rct
+	}
+	return objs
+}
+
+func (r *spectrumRenderer) Destroy() {}
+
+func (s *spectrumWidget) SetBars(vals []float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(vals) != len(s.bars) {
+		return
+	}
+	copy(s.bars, vals)
+	s.Refresh()
+}
+
+func (s *spectrumWidget) Decay() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.bars {
+		s.bars[i] *= 0.85
+		if s.bars[i] < 0.02 {
+			s.bars[i] = 0
+		}
+	}
+	s.Refresh()
+}
+
+// spectrumData backs a canvas.Raster visualizer
+type spectrumData struct {
+	mu   sync.Mutex
+	bars []float64
+}
+
+func newSpectrumData(n int) *spectrumData {
+	return &spectrumData{bars: make([]float64, n)}
+}
+
+func (s *spectrumData) SetBars(v []float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(v) != len(s.bars) {
+		return
+	}
+	copy(s.bars, v)
+}
+
+func (s *spectrumData) Decay() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.bars {
+		s.bars[i] *= 0.85
+		if s.bars[i] < 0.02 {
+			s.bars[i] = 0
+		}
+	}
+}
+
+func (s *spectrumData) Draw(w, h int) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	// background
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{R: 0x10, G: 0x10, B: 0x10, A: 0xFF})
+		}
+	}
+	s.mu.Lock()
+	bars := make([]float64, len(s.bars))
+	copy(bars, s.bars)
+	s.mu.Unlock()
+
+	n := len(bars)
+	if n == 0 || w <= 0 || h <= 0 {
+		return img
+	}
+	barW := w / n
+	for i, b := range bars {
+		bh := int(b * float64(h))
+		if bh < 1 {
+			bh = 1
+		}
+		x0 := i * barW
+		x1 := x0 + barW - 2
+		if x1 >= w {
+			x1 = w - 1
+		}
+		for x := x0; x <= x1; x++ {
+			for y := h - bh; y < h; y++ {
+				img.Set(x, y, color.RGBA{R: 0x00, G: 0xFF, B: 0x66, A: 0xFF})
+			}
+		}
+	}
+	return img
+}
+
 func main() {
 	flag.Parse()
 
@@ -1098,30 +1303,48 @@ func main() {
 		return
 	}
 
-	// GUI mode
 	a := app.NewWithID("com.example.audioplayer")
-	w := a.NewWindow("Audio Player")
-	w.Resize(fyne.NewSize(450, 220))
+	a.Settings().SetTheme(theme.DarkTheme())
+	w := a.NewWindow("Winamp Player")
+	w.Resize(fyne.NewSize(520, 460))
 
 	player := NewPlayer(w)
 	player.playlist = playlist
 
-	// If there are files in the playlist, load the first one
-	if playlist.Len() > 0 {
-		file := playlist.Next()
-		go func() {
-			if err := player.Load(file); err != nil {
-				fmt.Printf("Load error: %v\n", err)
-			} else {
-				player.Play()
-			}
-		}()
-	}
+	// Visualizer
+	specData := newSpectrumData(28)
+	visualizer := canvas.NewRaster(specData.Draw)
+	visualizer.SetMinSize(fyne.NewSize(0, 70))
+	player.visualizer = visualizer
 
-	openBtn := widget.NewButton("Open Audio File", func() {
-		debugPrintf("Open Audio File button clicked")
+	trackLabel := widget.NewLabel("No track loaded")
+	trackLabel.TextStyle = fyne.TextStyle{Bold: true}
+	player.trackLabel = trackLabel
+
+	statusLabel := widget.NewLabel("Stopped")
+	player.statusLabel = statusLabel
+
+	volumeValueLabel := widget.NewLabel("50%")
+	player.volumeValueLabel = volumeValueLabel
+
+	// Playlist UI
+	playlistList := widget.NewList(
+		func() int { return len(player.playlist.Files()) },
+		func() fyne.CanvasObject { return widget.NewLabel("track") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			files := player.playlist.Files()
+			if i >= 0 && i < len(files) {
+				o.(*widget.Label).SetText(filepath.Base(files[i]))
+			}
+		},
+	)
+	playlistScroll := container.NewScroll(playlistList)
+	playlistScroll.SetMinSize(fyne.NewSize(0, 150))
+
+	syncing := false
+
+	openBtn := widget.NewButtonWithIcon("Open", theme.FolderOpenIcon(), func() {
 		showFileOpenDialog(w, func(path string) {
-			debugPrintf("Selected file: %s", path)
 			go func() {
 				if err := player.Load(path); err != nil {
 					fyne.Do(func() { dialog.ShowError(err, w) })
@@ -1132,67 +1355,157 @@ func main() {
 		})
 	})
 
-	volumeLabel := widget.NewLabel("Volume:")
-	volumeSlider := widget.NewSlider(0, 100)
-	volumeSlider.Value = 50
-	volumeSlider.OnChanged = func(value float64) {
-		player.SetVolume(value / 100.0)
-	}
-	player.volumeSlider = volumeSlider
+	prevBtn := widget.NewButtonWithIcon("", theme.MediaSkipPreviousIcon(), func() {
+		go func() {
+			player.Stop()
+			file := player.playlist.Prev()
+			if file != "" {
+				if err := player.Load(file); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+				} else {
+					player.Play()
+					fyne.Do(func() {
+						syncing = true
+						playlistList.Select(player.playlist.Index())
+						syncing = false
+					})
+				}
+			}
+		}()
+	})
+	playBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() { player.Play() })
+	pauseBtn := widget.NewButtonWithIcon("", theme.MediaPauseIcon(), func() { player.Pause() })
+	stopBtn := widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() { player.Stop() })
+	nextBtn := widget.NewButtonWithIcon("", theme.MediaSkipNextIcon(), func() {
+		go func() {
+			player.Stop()
+			file := player.playlist.Next()
+			if file != "" {
+				if err := player.Load(file); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+				} else {
+					player.Play()
+					fyne.Do(func() {
+						syncing = true
+						playlistList.Select(player.playlist.Index())
+						syncing = false
+					})
+				}
+			}
+		}()
+	})
+	infoBtn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() { player.ShowInfo(w) })
+
+	controls := container.NewHBox(prevBtn, playBtn, pauseBtn, stopBtn, nextBtn, infoBtn, openBtn)
 
 	currentTimeLabel := widget.NewLabel("00:00")
 	totalTimeLabel := widget.NewLabel("00:00")
 	player.currentTimeLabel = currentTimeLabel
 	player.totalTimeLabel = totalTimeLabel
-
-	timeContainer := container.NewHBox(
-		currentTimeLabel,
-		widget.NewLabel(" / "),
-		totalTimeLabel,
-	)
+	timeContainer := container.NewHBox(currentTimeLabel, widget.NewLabel(" / "), totalTimeLabel)
 
 	progressBar := widget.NewSlider(0, 1)
 	progressBar.Step = 0.001
-
 	player.progressBar = progressBar
+	progressBar.OnChanged = func(value float64) { player.Seek(value) }
 
-	progressBar.OnChanged = func(value float64) {
-		player.Seek(value)
+	volumeSlider := widget.NewSlider(0, 100)
+	volumeSlider.Value = 50
+	volumeSlider.OnChanged = func(value float64) {
+		player.SetVolume(value / 100.0)
+		fyne.Do(func() { volumeValueLabel.SetText(fmt.Sprintf("%.0f%%", value)) })
+	}
+	player.volumeSlider = volumeSlider
+
+	playlistList.OnSelected = func(id int) {
+		if syncing {
+			return
+		}
+		files := player.playlist.Files()
+		if id < 0 || id >= len(files) {
+			return
+		}
+		player.playlist.SetIndex(id)
+		go func() {
+			player.Stop()
+			if err := player.Load(files[id]); err != nil {
+				fyne.Do(func() { dialog.ShowError(err, w) })
+			} else {
+				player.Play()
+				fyne.Do(func() {
+					syncing = true
+					playlistList.Select(id)
+					syncing = false
+				})
+			}
+		}()
 	}
 
-	playBtn := widget.NewButton("▶ Play", func() {
-		player.Play()
-	})
+	player.onTrackEnd = func() {
+		file := player.playlist.Next()
+		if file != "" {
+			if err := player.Load(file); err != nil {
+				fyne.Do(func() { dialog.ShowError(err, w) })
+			} else {
+				player.Play()
+				fyne.Do(func() {
+					syncing = true
+					playlistList.Select(player.playlist.Index())
+					syncing = false
+				})
+			}
+		}
+	}
 
-	pauseBtn := widget.NewButton("⏸ Pause", func() {
-		player.Pause()
-	})
+	if playlist.Len() > 0 {
+		file := playlist.Next()
+		go func() {
+			if err := player.Load(file); err != nil {
+				fyne.Do(func() { dialog.ShowError(err, w) })
+			} else {
+				player.Play()
+				fyne.Do(func() {
+					syncing = true
+					playlistList.Select(player.playlist.Index())
+					syncing = false
+				})
+			}
+		}()
+	}
 
-	stopBtn := widget.NewButton("⏹ Stop", func() {
-		player.Stop()
-	})
-
-	infoBtn := widget.NewButton("ℹ Info", func() {
-		player.ShowInfo(w)
-	})
-
-	controls := container.NewHBox(
-		infoBtn,
-		playBtn,
-		pauseBtn,
-		stopBtn,
-	)
+	// Visualizer animation
+	go func() {
+		ticker := time.NewTicker(90 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			player.mu.Lock()
+			playing := player.isPlaying
+			player.mu.Unlock()
+			if playing {
+				bars := make([]float64, len(specData.bars))
+				for i := range bars {
+					bars[i] = 0.15 + rand.Float64()*0.85
+				}
+				specData.SetBars(bars)
+				canvas.Refresh(visualizer)
+			} else {
+				specData.Decay()
+				canvas.Refresh(visualizer)
+			}
+		}
+	}()
 
 	content := container.NewVBox(
-		openBtn,
-		container.NewCenter(controls),
-		volumeLabel,
-		volumeSlider,
+		container.NewHBox(trackLabel, container.NewHBox(statusLabel)),
+		visualizer,
+		controls,
 		widget.NewLabel("Progress:"),
 		progressBar,
 		container.NewCenter(timeContainer),
+		container.NewBorder(nil, nil, widget.NewLabel("Volume:"), volumeValueLabel, volumeSlider),
+		widget.NewLabel("Playlist:"),
+		playlistScroll,
 	)
-
 	w.SetContent(content)
 	w.ShowAndRun()
 
