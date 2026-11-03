@@ -1,4 +1,5 @@
 // go build -o mplayer.exe -ldflags "-s -w -H=windowsgui" 2>&1
+// CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o mplayer .
 // go build -tiny -o mplayer.exe -ldflags "-s -w -H=windowsgui"  2>&1
 // upx.exe --best .\mplayer.exe
 package main
@@ -6,7 +7,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math/rand"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,6 +112,18 @@ func (pl *Playlist) Prev() string {
 	return pl.files[pl.index]
 }
 
+// IndexOf возвращает индекс файла в плейлисте или -1
+func (pl *Playlist) IndexOf(path string) int {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for i, p := range pl.files {
+		if p == path {
+			return i
+		}
+	}
+	return -1
+}
+
 // Files returns a copy of the playlist files
 func (pl *Playlist) Files() []string {
 	pl.mu.Lock()
@@ -141,6 +154,93 @@ func (pl *Playlist) SetIndex(i int) {
 	if i >= 0 && i < len(pl.files) {
 		pl.index = i
 	}
+}
+
+// RemoveAt удаляет трек по индексу. Возвращает true, если удаление выполнено.
+func (pl *Playlist) RemoveAt(i int) bool {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	if i < 0 || i >= len(pl.files) {
+		return false
+	}
+	pl.files = append(pl.files[:i], pl.files[i+1:]...)
+	if len(pl.files) == 0 {
+		pl.index = -1
+		return true
+	}
+	if pl.index > i {
+		pl.index--
+	} else if pl.index == i {
+		if pl.index >= len(pl.files) {
+			pl.index = len(pl.files) - 1
+		}
+	}
+	return true
+}
+
+// Clear очищает плейлист.
+func (pl *Playlist) Clear() {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	pl.files = pl.files[:0]
+	pl.index = -1
+}
+
+// AddFiles добавляет несколько файлов.
+func (pl *Playlist) AddFiles(paths []string) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for _, p := range paths {
+		pl.files = append(pl.files, p)
+	}
+}
+
+// Save сохраняет плейлист в файл (по одному пути на строку).
+func (pl *Playlist) Save(path string) error {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, p := range pl.files {
+		if _, err := fmt.Fprintln(f, p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadPlaylist загружает плейлист из файла, заменяя текущий.
+func (pl *Playlist) LoadPlaylist(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	baseDir := filepath.Dir(path)
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	pl.files = pl.files[:0]
+	pl.index = -1
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !filepath.IsAbs(line) {
+			line = filepath.Join(baseDir, line)
+		}
+		ext := strings.ToLower(filepath.Ext(line))
+		if ext != ".mp3" && ext != ".flac" && ext != ".ogg" && ext != ".wav" {
+			continue
+		}
+		if _, err := os.Stat(line); err != nil {
+			continue
+		}
+		pl.files = append(pl.files, line)
+	}
+	return nil
 }
 
 var (
@@ -185,6 +285,7 @@ type Player struct {
 	ctrl          *beep.Ctrl
 	format        beep.Format
 	speakerInited bool
+	analyzer      *spectrumAnalyzer
 
 	// State
 	isPlaying      bool
@@ -508,9 +609,14 @@ func (p *Player) Play() {
 	// Create controller
 	p.ctrl = &beep.Ctrl{Streamer: p.streamer, Paused: false}
 
+	// Тап для реального анализа спектра: перехватывает сэмплы до передачи в динамик
+	an := newSpectrumAnalyzer(float64(p.format.SampleRate), p.format.NumChannels)
+	tap := &tapStreamer{inner: p.ctrl, an: an}
+	p.analyzer = an
+
 	// Create volume effect
 	p.volumeStreamer = &effects.Volume{
-		Streamer: p.ctrl,
+		Streamer: tap,
 		Base:     2,
 		Volume:   -5 + p.volume*5,
 		Silent:   p.volume <= 0,
@@ -1249,6 +1355,237 @@ func (s *spectrumData) Draw(w, h int) image.Image {
 	return img
 }
 
+// ---------- Реальный анализ спектра (FFT) ----------
+
+const fftSize = 2048 // размер окна FFT, степень двойки
+const hopSize = fftSize / 4
+
+// Диапазон частот для шкалы (как у большинства визуализаторов: лог-шкала от басов до верха)
+const minSpectrumFreqHz = 35.0
+const maxSpectrumFreqHz = 16000.0
+
+// tapStreamer перехватывает сэмплы, идущие в динамик, и передаёт их анализатору спектра
+type tapStreamer struct {
+	inner beep.Streamer
+	an    *spectrumAnalyzer
+}
+
+func (t *tapStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+	n, ok = t.inner.Stream(samples)
+	if n > 0 && t.an != nil {
+		t.an.AddSamples(samples[:n])
+	}
+	return n, ok
+}
+
+func (t *tapStreamer) Err() error { return t.inner.Err() }
+
+// spectrumAnalyzer накапливает сэмплы в кольцевом буфере и считает амплитудный спектр.
+// AddSamples вызывается из аудио-потока beep, Update — из потока GUI.
+type spectrumAnalyzer struct {
+	mu         sync.Mutex
+	sampleRate float64
+	channels   int
+	ring       []int16 // кольцевой буфер моно-сэмплов
+	writeIdx   int
+	written    uint64
+	consumed   uint64
+
+	re, im     []float64 // рабочее пространство FFT (перисутуется)
+	twRe, twIm []float64 // готовые таблички поворотных множителей (twiddle)
+	win        []float64 // окно Ханна
+	nBars      int
+	mags       []float64 // амплитуды текущего кадра по барам
+	disp       []float64 // сглаженные значения по барам
+	globalPeak float64   // глобальный подвижной пик для автонормировки
+}
+
+// newSpectrumAnalyzer создаёт анализатор под частоту дискретизации и число каналов дорожки
+func newSpectrumAnalyzer(sampleRate float64, channels int) *spectrumAnalyzer {
+	if channels < 1 {
+		channels = 1
+	}
+	a := &spectrumAnalyzer{
+		sampleRate: sampleRate,
+		channels:   channels,
+		ring:       make([]int16, fftSize*8),
+		re:         make([]float64, fftSize),
+		im:         make([]float64, fftSize),
+		twRe:       make([]float64, fftSize/2+1),
+		twIm:       make([]float64, fftSize/2+1),
+		win:        make([]float64, fftSize),
+	}
+	for j := 0; j <= fftSize/2; j++ {
+		angle := -2 * math.Pi * float64(j) / float64(fftSize)
+		a.twRe[j] = math.Cos(angle)
+		a.twIm[j] = math.Sin(angle)
+	}
+	for i := 0; i < fftSize; i++ {
+		a.win[i] = 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(fftSize-1)))
+	}
+	return a
+}
+
+// AddSamples добавляет сэмплы из аудио-потока в кольцевой буфер (моно-миксдаун)
+func (a *spectrumAnalyzer) AddSamples(s [][2]float64) {
+	ch := a.channels
+	capacity := len(a.ring)
+	a.mu.Lock()
+	if a.written-a.consumed >= uint64(capacity) {
+		a.consumed = a.written // буфер переполнен — старые сэмплы не нужны
+	}
+	for i := range s {
+		v := s[i][0]
+		if ch > 1 {
+			v = (v + s[i][1]) / 2.0
+		}
+		if v > 1 {
+			v = 1
+		} else if v < -1 {
+			v = -1
+		}
+		a.ring[a.writeIdx] = int16(v * 32767)
+		a.writeIdx++
+		if a.writeIdx == capacity {
+			a.writeIdx = 0
+		}
+		a.written++
+	}
+	a.mu.Unlock()
+}
+
+// Update вычисляет нормализованные уровни баров из последнего окна сэмплов.
+// Если новых данных нет, значения плавно затухают.
+func (a *spectrumAnalyzer) Update(out []float64) {
+	nb := len(out)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.nBars != nb {
+		a.mags = make([]float64, nb)
+		a.disp = make([]float64, nb)
+		a.nBars = nb
+	}
+
+	if a.written < fftSize || int(a.written-a.consumed) < hopSize {
+		for i := range out {
+			d := a.disp[i] * 0.75
+			if d < 0.01 {
+				d = 0
+			}
+			a.disp[i] = d
+			out[i] = d
+		}
+		return
+	}
+
+	start := int(a.written) - fftSize
+	capacity := len(a.ring)
+	for i := 0; i < fftSize; i++ {
+		idx := (start + i) % capacity
+		a.re[i] = float64(a.ring[idx]) / 32768.0 * a.win[i]
+		a.im[i] = 0
+	}
+	a.consumed += hopSize
+
+	a.fft()
+
+	binHz := a.sampleRate / float64(fftSize)
+	half := fftSize / 2
+	ratio := maxSpectrumFreqHz / minSpectrumFreqHz
+	perBar := math.Pow(ratio, 1.0/float64(nb))
+	// Первый проход: амплитуда каждого бара (максимум по бинам FFT в диапазоне частот бара)
+	maxAmp := 0.0
+	for b := 0; b < nb; b++ {
+		fLo := minSpectrumFreqHz * math.Pow(perBar, float64(b))
+		fHi := minSpectrumFreqHz * math.Pow(perBar, float64(b+1))
+		kLo := int(fLo / binHz)
+		kHi := int(fHi / binHz)
+		if kLo < 1 {
+			kLo = 1
+		}
+		if kHi <= kLo {
+			kHi = kLo + 1
+		}
+		if kHi > half-1 {
+			kHi = half - 1
+		}
+		mag := 0.0
+		for k := kLo; k < kHi; k++ {
+			m := math.Sqrt(a.re[k]*a.re[k] + a.im[k]*a.im[k])
+			if m > mag {
+				mag = m
+			}
+		}
+		a.mags[b] = 0.5 * mag / float64(fftSize)
+		if a.mags[b] > maxAmp {
+			maxAmp = a.mags[b]
+		}
+	}
+
+	// Глобальный подвижной пик: громчайший компонент кадра показывает полный уровень,
+	// остальные — пропорционально (классическая автонормировка Winamp)
+	globalPeak := a.globalPeak * 0.92
+	if maxAmp > globalPeak {
+		globalPeak = maxAmp
+	}
+	a.globalPeak = globalPeak
+
+	// Второй проход: нормализация и сглаживание (быстрая атака, плавный спад)
+	for b := 0; b < nb; b++ {
+		var v float64
+		if globalPeak > 1e-7 {
+			v = a.mags[b] / globalPeak
+		}
+		if v > 1 {
+			v = 1
+		} else if v < 0.02 {
+			v = 0
+		}
+		d := math.Max(v, a.disp[b]*0.75)
+		a.disp[b] = d
+		out[b] = d
+	}
+}
+
+// fft — итеративное БПФ Кули–Тьюки (in-place), таблички поворотных множителей заранее
+func (a *spectrumAnalyzer) fft() {
+	re, im := a.re, a.im
+	n := len(re)
+
+	for i, j := 1, 0; i < n-1; i++ {
+		bit := n >> 1
+		for j&bit != 0 {
+			j ^= bit
+			bit >>= 1
+		}
+		j |= bit
+		if i < j {
+			re[i], re[j] = re[j], re[i]
+			im[i], im[j] = im[j], im[i]
+		}
+	}
+
+	for length := 2; length <= n; length <<= 1 {
+		half := length >> 1
+		skip := n / length
+		for i := 0; i < n; i += length {
+			for k := 0; k < half; k++ {
+				wr := a.twRe[k*skip]
+				wi := a.twIm[k*skip]
+				j := i + k
+				m := j + half
+				tre := re[m]*wr - im[m]*wi
+				tim := re[m]*wi + im[m]*wr
+				re[m] = re[j] - tre
+				im[m] = im[j] - tim
+				re[j] += tre
+				im[j] += tim
+			}
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 
@@ -1305,7 +1642,7 @@ func main() {
 
 	a := app.NewWithID("com.example.audioplayer")
 	a.Settings().SetTheme(theme.DarkTheme())
-	w := a.NewWindow("Winamp Player")
+	w := a.NewWindow("Media Player")
 	w.Resize(fyne.NewSize(520, 460))
 
 	player := NewPlayer(w)
@@ -1473,25 +1810,23 @@ func main() {
 		}()
 	}
 
-	// Visualizer animation
+	// Visualizer animation: реальный спектр из потока аудио (FFT)
 	go func() {
-		ticker := time.NewTicker(90 * time.Millisecond)
+		ticker := time.NewTicker(40 * time.Millisecond)
 		defer ticker.Stop()
 		for range ticker.C {
 			player.mu.Lock()
+			analyzer := player.analyzer
 			playing := player.isPlaying
 			player.mu.Unlock()
-			if playing {
+			if playing && analyzer != nil {
 				bars := make([]float64, len(specData.bars))
-				for i := range bars {
-					bars[i] = 0.15 + rand.Float64()*0.85
-				}
+				analyzer.Update(bars)
 				specData.SetBars(bars)
-				canvas.Refresh(visualizer)
 			} else {
 				specData.Decay()
-				canvas.Refresh(visualizer)
 			}
+			fyne.Do(func() { canvas.Refresh(visualizer) })
 		}
 	}()
 
