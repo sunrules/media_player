@@ -7,6 +7,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,9 +25,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-
-	"image"
-	"image/color"
 
 	"github.com/eiannone/keyboard"
 	"github.com/faiface/beep"
@@ -759,6 +759,124 @@ Total samples: %d`,
 	dialog.ShowInformation("Media File Information", info, parent)
 }
 
+// ShowFileInfo shows information about the given file without loading it into the player
+func (p *Player) ShowFileInfo(path string, parent fyne.Window) {
+	file, err := os.Open(path)
+	if err != nil {
+		dialog.ShowError(err, parent)
+		return
+	}
+	var fileSize int64
+	if fi, err := file.Stat(); err == nil {
+		fileSize = fi.Size()
+	}
+
+	ext := getFileExtension(path)
+	var streamer beep.StreamSeeker
+	var format beep.Format
+	var closeFile bool = true
+
+	switch ext {
+	case "mp3":
+		s, f, err := mp3.Decode(file)
+		if err != nil {
+			file.Close()
+			dialog.ShowError(err, parent)
+			return
+		}
+		streamer = s
+		format = f
+	case "flac":
+		s, f, err := flac.Decode(file)
+		if err != nil {
+			file.Close()
+			dialog.ShowError(err, parent)
+			return
+		}
+		streamer = s
+		format = f
+	case "ogg":
+		s, f, err := vorbis.Decode(file)
+		if err != nil {
+			file.Close()
+			dialog.ShowError(err, parent)
+			return
+		}
+		streamer = s
+		format = f
+	case "wav":
+		s, f, err := wav.Decode(file)
+		if err != nil {
+			file.Close()
+			dialog.ShowError(err, parent)
+			return
+		}
+		buf := beep.NewBuffer(f)
+		buf.Append(s)
+		decErr := s.Err()
+		s.Close() // closes file
+		closeFile = false
+		if decErr != nil {
+			dialog.ShowError(decErr, parent)
+			return
+		}
+		streamer = buf.Streamer(0, buf.Len())
+		format = f
+	default:
+		file.Close()
+		dialog.ShowError(fmt.Errorf("unsupported format: %s", ext), parent)
+		return
+	}
+
+	totalSamples := streamer.Len()
+	duration := format.SampleRate.D(totalSamples).Seconds()
+
+	if closeFile {
+		if c, ok := streamer.(io.Closer); ok {
+			c.Close()
+		}
+	}
+
+	var sizeStr string
+	if fileSize < 1024 {
+		sizeStr = fmt.Sprintf("%d bytes", fileSize)
+	} else if fileSize < 1024*1024 {
+		sizeStr = fmt.Sprintf("%.2f KB", float64(fileSize)/1024)
+	} else {
+		sizeStr = fmt.Sprintf("%.2f MB", float64(fileSize)/(1024*1024))
+	}
+
+	fileName := path
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '\\' || path[i] == '/' {
+			fileName = path[i+1:]
+			break
+		}
+	}
+
+	info := fmt.Sprintf(`File Information:
+
+File name: %s
+Format: %s
+Size: %s
+
+Sample rate: %d Hz
+Channels: %d
+Duration: %s
+
+Total samples: %d`,
+		fileName,
+		strings.ToUpper(ext),
+		sizeStr,
+		format.SampleRate,
+		format.NumChannels,
+		p.formatTime(duration),
+		totalSamples,
+	)
+
+	dialog.ShowInformation("Media File Information", info, parent)
+}
+
 // Seek seeks to position (0.0 - 1.0)
 func (p *Player) Seek(pos float64) {
 	debugPrintf("Seeking to position: %.2f", pos)
@@ -1016,14 +1134,15 @@ type browseEntry struct {
 }
 
 type browseState struct {
-	dir      string
-	items    []browseEntry
-	selected int
+	dir           string
+	items         []browseEntry
+	selected      int
+	selectedFiles map[int]bool
 }
 
 var lastOpenDir = "" // запоминаем последнюю папку между запусками диалога
 
-func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
+func showFileOpenDialog(parent fyne.Window, onConfirm func(paths []string)) {
 	a := fyne.CurrentApp()
 	w := a.NewWindow("Открыть аудиофайл")
 	w.Resize(fyne.NewSize(760, 540)) // начальный размер, окно можно растянуть
@@ -1038,7 +1157,7 @@ func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
 		}
 	}
 
-	st := &browseState{dir: startDir, selected: -1}
+	st := &browseState{dir: startDir, selected: -1, selectedFiles: make(map[int]bool)}
 
 	pathLabel := widget.NewLabel(displayBrowseDir(st.dir))
 	statusLabel := widget.NewLabel("") // здесь виден ПОЛНЫЙ путь — длинные имена не теряются
@@ -1056,18 +1175,39 @@ func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
 			} else {
 				l.TextStyle = fyne.TextStyle{}
 			}
-			l.SetText(e.name)
+			name := e.name
+			if !e.isDir && st.selectedFiles[int(id)] {
+				name = "✓ " + name
+			}
+			l.SetText(name)
 		},
 	)
 
 	openBtn := widget.NewButton("Открыть", func() {
-		if st.selected < 0 || st.selected >= len(st.items) || st.items[st.selected].isDir {
+		var paths []string
+		for id, ok := range st.selectedFiles {
+			if !ok || id < 0 || id >= len(st.items) {
+				continue
+			}
+			e := st.items[id]
+			if e.isDir {
+				continue
+			}
+			var full string
+			switch {
+			case e.path != "":
+				full = e.path
+			default:
+				full = filepath.Join(st.dir, e.name)
+			}
+			paths = append(paths, full)
+		}
+		if len(paths) == 0 {
 			return
 		}
-		path := filepath.Join(st.dir, st.items[st.selected].name)
 		lastOpenDir = st.dir
 		w.Close()
-		onConfirm(path)
+		onConfirm(paths)
 	})
 	openBtn.Disable()
 
@@ -1110,7 +1250,20 @@ func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
 			loadBrowseDir(list, st)
 			return
 		}
-		openBtn.Enable()
+		// toggle selection for file
+		if st.selectedFiles[int(id)] {
+			delete(st.selectedFiles, int(id))
+		} else {
+			st.selectedFiles[int(id)] = true
+		}
+		// enable open button if any selected
+		if len(st.selectedFiles) > 0 {
+			openBtn.Enable()
+		} else {
+			openBtn.Disable()
+		}
+		list.Unselect(id)
+		list.Refresh()
 	}
 
 	toolbar := container.NewHBox(upBtn, openBtn, cancelBtn)
@@ -1123,6 +1276,94 @@ func showFileOpenDialog(parent fyne.Window, onConfirm func(path string)) {
 
 	loadBrowseDir(list, st)
 	w.Show() // ShowAndRun вызывать нельзя — он заблокирует основной цикл главного окна
+}
+
+// showAddToPlaylistDialog открывает диалог выбора файлов/папок для добавления в плейлист
+func showAddToPlaylistDialog(parent fyne.Window, onConfirm func(paths []string)) {
+	a := fyne.CurrentApp()
+	w := a.NewWindow("Добавить в плейлист")
+	w.Resize(fyne.NewSize(520, 400))
+	w.CenterOnScreen()
+
+	st := &browseState{dir: lastOpenDir, selected: -1}
+	if st.dir == "" {
+		st.dir = entryPC
+	}
+	lastOpenDir = st.dir
+
+	pathLabel := widget.NewLabel(displayBrowseDir(st.dir))
+	pathLabel.TextStyle = fyne.TextStyle{Bold: true}
+	statusLabel := widget.NewLabel("")
+	var list *widget.List
+	upBtn := widget.NewButton("⬆ Вверх", func() {
+		if st.dir == "" || st.dir == entryPC {
+			st.dir = entryPC
+		} else {
+			st.dir = filepath.Dir(st.dir)
+		}
+		pathLabel.SetText(displayBrowseDir(st.dir))
+		loadBrowseDir(list, st)
+	})
+	openBtn := widget.NewButtonWithIcon("Добавить", theme.ConfirmIcon(), func() {
+		var paths []string
+		if st.selected >= 0 && st.selected < len(st.items) {
+			if st.items[st.selected].isDir {
+				entries, err := os.ReadDir(st.items[st.selected].path)
+				if err != nil {
+					dialog.ShowError(err, w)
+					return
+				}
+				for _, e := range entries {
+					if e.IsDir() {
+						continue
+					}
+					ext := strings.ToLower(filepath.Ext(e.Name()))
+					if ext == ".mp3" || ext == ".flac" || ext == ".ogg" || ext == ".wav" {
+						paths = append(paths, filepath.Join(st.items[st.selected].path, e.Name()))
+					}
+				}
+			} else {
+				paths = append(paths, st.items[st.selected].path)
+			}
+		}
+		if len(paths) == 0 {
+			return
+		}
+		w.Close()
+		onConfirm(paths)
+	})
+	cancelBtn := widget.NewButtonWithIcon("Отмена", theme.CancelIcon(), func() { w.Close() })
+	list = widget.NewList(
+		func() int { return len(st.items) },
+		func() fyne.CanvasObject { return widget.NewLabel("item") },
+		func(id int, o fyne.CanvasObject) {
+			if id < len(st.items) {
+				o.(*widget.Label).SetText(st.items[id].name)
+			}
+		},
+	)
+	list.OnSelected = func(id int) {
+		st.selected = id
+		if id < len(st.items) {
+			if st.items[id].isDir {
+				st.dir = st.items[id].path
+				pathLabel.SetText(displayBrowseDir(st.dir))
+				loadBrowseDir(list, st)
+				return
+			}
+		}
+		openBtn.Enable()
+	}
+
+	toolbar := container.NewHBox(upBtn, openBtn, cancelBtn)
+	content := container.NewBorder(
+		container.NewVBox(pathLabel, toolbar),
+		statusLabel,
+		nil, nil, list,
+	)
+	w.SetContent(content)
+	loadBrowseDir(list, st)
+	w.Show()
 }
 
 func displayBrowseDir(dir string) string {
@@ -1183,6 +1424,7 @@ func loadBrowseDir(list *widget.List, st *browseState) {
 	}
 	st.items = newItems
 	st.selected = -1
+	st.selectedFiles = make(map[int]bool)
 	list.UnselectAll()
 	list.Refresh()
 }
@@ -1586,6 +1828,15 @@ func (a *spectrumAnalyzer) fft() {
 	}
 }
 
+// deleteShortcut implements fyne.KeyboardShortcut for the Delete key.
+type deleteShortcut struct{}
+
+func (deleteShortcut) ShortcutName() string { return "DeleteTrack" }
+
+func (deleteShortcut) Key() fyne.KeyName { return fyne.KeyDelete }
+
+func (deleteShortcut) Mod() fyne.KeyModifier { return 0 }
+
 func main() {
 	flag.Parse()
 
@@ -1664,6 +1915,10 @@ func main() {
 	volumeValueLabel := widget.NewLabel("50%")
 	player.volumeValueLabel = volumeValueLabel
 
+	selectedPlaylistIndex := -1
+	lastTapIndex := -1
+	var lastTapTime time.Time
+
 	// Playlist UI
 	playlistList := widget.NewList(
 		func() int { return len(player.playlist.Files()) },
@@ -1671,7 +1926,14 @@ func main() {
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			files := player.playlist.Files()
 			if i >= 0 && i < len(files) {
-				o.(*widget.Label).SetText(filepath.Base(files[i]))
+				label := o.(*widget.Label)
+				if int(i) == selectedPlaylistIndex {
+					label.TextStyle = fyne.TextStyle{Bold: true}
+					label.SetText("▶ " + filepath.Base(files[i]))
+				} else {
+					label.TextStyle = fyne.TextStyle{}
+					label.SetText(filepath.Base(files[i]))
+				}
 			}
 		},
 	)
@@ -1680,13 +1942,36 @@ func main() {
 
 	syncing := false
 
+	refreshPlaylist := func() {
+		fyne.Do(func() {
+			old := player.playlist.Index()
+			selectedPlaylistIndex = old
+			playlistList.Refresh()
+		})
+	}
+
 	openBtn := widget.NewButtonWithIcon("Open", theme.FolderOpenIcon(), func() {
-		showFileOpenDialog(w, func(path string) {
+		showFileOpenDialog(w, func(paths []string) {
+			if len(paths) == 0 {
+				return
+			}
 			go func() {
-				if err := player.Load(path); err != nil {
+				player.playlist.AddFiles(paths)
+				idx := player.playlist.IndexOf(paths[0])
+				if idx >= 0 {
+					player.playlist.SetIndex(idx)
+				}
+				refreshPlaylist()
+				if err := player.Load(paths[0]); err != nil {
 					fyne.Do(func() { dialog.ShowError(err, w) })
 				} else {
 					player.Play()
+					fyne.Do(func() {
+						syncing = true
+						selectedPlaylistIndex = player.playlist.Index()
+						playlistList.Refresh()
+						syncing = false
+					})
 				}
 			}()
 		})
@@ -1703,7 +1988,8 @@ func main() {
 					player.Play()
 					fyne.Do(func() {
 						syncing = true
-						playlistList.Select(player.playlist.Index())
+						selectedPlaylistIndex = player.playlist.Index()
+						playlistList.Refresh()
 						syncing = false
 					})
 				}
@@ -1724,16 +2010,41 @@ func main() {
 					player.Play()
 					fyne.Do(func() {
 						syncing = true
-						playlistList.Select(player.playlist.Index())
+						selectedPlaylistIndex = player.playlist.Index()
+						playlistList.Refresh()
 						syncing = false
 					})
 				}
 			}
 		}()
 	})
-	infoBtn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() { player.ShowInfo(w) })
+	delBtn := widget.NewButtonWithIcon("Del", theme.DeleteIcon(), func() {
+		if selectedPlaylistIndex < 0 {
+			return
+		}
+		player.playlist.RemoveAt(selectedPlaylistIndex)
+		if player.playlist.Len() == 0 {
+			selectedPlaylistIndex = -1
+			player.Stop()
+		} else {
+			if selectedPlaylistIndex >= player.playlist.Len() {
+				selectedPlaylistIndex = player.playlist.Len() - 1
+			}
+			player.playlist.SetIndex(selectedPlaylistIndex)
+		}
+		refreshPlaylist()
+	})
 
-	controls := container.NewHBox(prevBtn, playBtn, pauseBtn, stopBtn, nextBtn, infoBtn, openBtn)
+	infoBtn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
+		files := player.playlist.Files()
+		if selectedPlaylistIndex >= 0 && selectedPlaylistIndex < len(files) {
+			player.ShowFileInfo(files[selectedPlaylistIndex], w)
+		} else {
+			player.ShowInfo(w)
+		}
+	})
+
+	controls := container.NewHBox(prevBtn, playBtn, pauseBtn, stopBtn, nextBtn, infoBtn, openBtn, delBtn)
 
 	currentTimeLabel := widget.NewLabel("00:00")
 	totalTimeLabel := widget.NewLabel("00:00")
@@ -1760,22 +2071,32 @@ func main() {
 		}
 		files := player.playlist.Files()
 		if id < 0 || id >= len(files) {
+			playlistList.Unselect(id)
 			return
 		}
-		player.playlist.SetIndex(id)
-		go func() {
-			player.Stop()
-			if err := player.Load(files[id]); err != nil {
-				fyne.Do(func() { dialog.ShowError(err, w) })
-			} else {
-				player.Play()
-				fyne.Do(func() {
-					syncing = true
-					playlistList.Select(id)
-					syncing = false
-				})
-			}
-		}()
+		now := time.Now()
+		if id == lastTapIndex && now.Sub(lastTapTime) < 300*time.Millisecond {
+			// double click -> play
+			player.playlist.SetIndex(id)
+			selectedPlaylistIndex = id
+			playlistList.Refresh()
+			go func() {
+				player.Stop()
+				if err := player.Load(files[id]); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+				} else {
+					player.Play()
+				}
+			}()
+		} else {
+			// single click -> just select
+			selectedPlaylistIndex = id
+			player.playlist.SetIndex(id)
+			playlistList.Refresh()
+		}
+		lastTapIndex = id
+		lastTapTime = now
+		playlistList.Unselect(id)
 	}
 
 	player.onTrackEnd = func() {
@@ -1787,7 +2108,8 @@ func main() {
 				player.Play()
 				fyne.Do(func() {
 					syncing = true
-					playlistList.Select(player.playlist.Index())
+					selectedPlaylistIndex = player.playlist.Index()
+					playlistList.Refresh()
 					syncing = false
 				})
 			}
@@ -1803,10 +2125,12 @@ func main() {
 				player.Play()
 				fyne.Do(func() {
 					syncing = true
-					playlistList.Select(player.playlist.Index())
+					selectedPlaylistIndex = player.playlist.Index()
+					playlistList.Refresh()
 					syncing = false
 				})
 			}
+
 		}()
 	}
 
@@ -1829,6 +2153,23 @@ func main() {
 			fyne.Do(func() { canvas.Refresh(visualizer) })
 		}
 	}()
+
+	w.Canvas().AddShortcut(deleteShortcut{}, func(_ fyne.Shortcut) {
+		if selectedPlaylistIndex < 0 {
+			return
+		}
+		player.playlist.RemoveAt(selectedPlaylistIndex)
+		if player.playlist.Len() == 0 {
+			selectedPlaylistIndex = -1
+			player.Stop()
+		} else {
+			if selectedPlaylistIndex >= player.playlist.Len() {
+				selectedPlaylistIndex = player.playlist.Len() - 1
+			}
+			player.playlist.SetIndex(selectedPlaylistIndex)
+		}
+		refreshPlaylist()
+	})
 
 	content := container.NewVBox(
 		container.NewHBox(trackLabel, container.NewHBox(statusLabel)),
