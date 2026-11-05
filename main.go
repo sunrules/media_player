@@ -5,6 +5,8 @@
 package main
 
 import (
+	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -1837,6 +1839,42 @@ func (deleteShortcut) Key() fyne.KeyName { return fyne.KeyDelete }
 
 func (deleteShortcut) Mod() fyne.KeyModifier { return 0 }
 
+//go:embed madia_player.png
+var appIcon []byte
+
+// playerState is persisted between launches
+type playerState struct {
+	Files         []string `json:"files"`
+	Index         int      `json:"index"`
+	SelectedIndex int      `json:"selectedIndex"`
+	LastOpenDir   string   `json:"lastOpenDir"`
+	Volume        float64  `json:"volume"`
+}
+
+func stateFilePath() string {
+	return filepath.Join(os.TempDir(), "mplayer_state.json")
+}
+
+func loadState() (playerState, bool) {
+	data, err := os.ReadFile(stateFilePath())
+	if err != nil {
+		return playerState{}, false
+	}
+	var st playerState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return playerState{}, false
+	}
+	return st, true
+}
+
+func saveState(st playerState) {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(stateFilePath(), data, 0644)
+}
+
 func main() {
 	flag.Parse()
 
@@ -1880,6 +1918,21 @@ func main() {
 		}
 	}
 
+	// Restore saved state (playlist, last folder, volume) when no command-line files were given
+	savedState, hasSavedState := loadState()
+	if hasSavedState {
+		lastOpenDir = savedState.LastOpenDir
+		if len(args) == 0 && len(savedState.Files) > 0 {
+			playlist = NewPlaylist()
+			for _, f := range savedState.Files {
+				playlist.AddFile(f)
+			}
+			if savedState.Index >= 0 && savedState.Index < playlist.Len() {
+				playlist.SetIndex(savedState.Index)
+			}
+		}
+	}
+
 	// Console mode
 	if consoleFlag {
 		if playlist.Len() == 0 {
@@ -1893,11 +1946,17 @@ func main() {
 
 	a := app.NewWithID("com.example.audioplayer")
 	a.Settings().SetTheme(theme.DarkTheme())
+	iconRes := fyne.NewStaticResource("madia_player.png", appIcon)
+	a.SetIcon(iconRes)
 	w := a.NewWindow("Media Player")
+	w.SetIcon(iconRes)
 	w.Resize(fyne.NewSize(520, 460))
 
 	player := NewPlayer(w)
 	player.playlist = playlist
+	if hasSavedState && savedState.Volume > 0 {
+		player.volume = savedState.Volume
+	}
 
 	// Visualizer
 	specData := newSpectrumData(28)
@@ -2065,6 +2124,20 @@ func main() {
 	}
 	player.volumeSlider = volumeSlider
 
+	if hasSavedState {
+		if savedState.SelectedIndex >= 0 && savedState.SelectedIndex < player.playlist.Len() {
+			selectedPlaylistIndex = savedState.SelectedIndex
+		} else {
+			selectedPlaylistIndex = player.playlist.Index()
+		}
+		if savedState.Volume > 0 {
+			volumeSlider.Value = savedState.Volume * 100
+			fyne.Do(func() { volumeValueLabel.SetText(fmt.Sprintf("%.0f%%", savedState.Volume*100)) })
+		}
+	} else {
+		selectedPlaylistIndex = player.playlist.Index()
+	}
+
 	playlistList.OnSelected = func(id int) {
 		if syncing {
 			return
@@ -2169,6 +2242,42 @@ func main() {
 			player.playlist.SetIndex(selectedPlaylistIndex)
 		}
 		refreshPlaylist()
+	})
+
+	// Load selected track metadata without starting playback
+	if player.playlist.Len() > 0 {
+		idx := selectedPlaylistIndex
+		if idx < 0 || idx >= player.playlist.Len() {
+			idx = player.playlist.Index()
+		}
+		if idx >= 0 {
+			go func() {
+				files := player.playlist.Files()
+				if idx < len(files) {
+					_ = player.Load(files[idx])
+				}
+			}()
+		}
+	}
+
+	// Persist state on close
+	w.SetOnClosed(func() {
+		saveState(playerState{
+			Files:         player.playlist.Files(),
+			Index:         player.playlist.Index(),
+			SelectedIndex: selectedPlaylistIndex,
+			LastOpenDir:   lastOpenDir,
+			Volume:        player.volume,
+		})
+	})
+
+	// Initial state file
+	saveState(playerState{
+		Files:         player.playlist.Files(),
+		Index:         player.playlist.Index(),
+		SelectedIndex: selectedPlaylistIndex,
+		LastOpenDir:   lastOpenDir,
+		Volume:        player.volume,
 	})
 
 	content := container.NewVBox(

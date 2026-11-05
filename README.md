@@ -1,123 +1,139 @@
 # Audio Player
 
-A modern audio player for Windows with support for multiple formats and console mode.
+Современный аудиоплеер для Windows с поддержкой нескольких форматов и консольным режимом.
 
-## Features
+## Возможности
 
-### Supported Formats
+### Поддерживаемые форматы
 - **MP3** - MPEG Audio Layer 3
-- **FLAC** - Free Lossless Audio Codec (lossless compression)
+- **FLAC** - Free Lossless Audio Codec (сжатие без потерь)
 - **OGG** - Ogg Vorbis
 - **WAV** - Waveform Audio File Format
 
-### Operating Modes
-- **GUI Mode** - Graphical interface with buttons and sliders
-- **Console Mode** - Keyboard controls
+### Режимы работы
+- **GUI Mode** - графический интерфейс с кнопками и слайдерами
+- **Console Mode** - управление с клавиатуры
 
-### Playback Functions
-- ▶ Play audio files
-- ⏸ Pause
-- ⏹ Stop
-- Seek using progress slider or arrow keys
-- Volume control (logarithmic scale)
-- Automatic track duration detection
-- Playlist with folder and multiple file support
+### Воспроизведение
+- Воспроизведение аудиофайлов
+- Пауза
+- Остановка
+- Перемотка через слайдер прогресса или стрелками
+- Регулировка громкости (логарифмическая шкала)
+- Автоматическое определение длительности трека
+- Плейлист с поддержкой папок и нескольких файлов
 
-### File Information
-The "Info" button displays detailed information about the loaded file:
-- File name
-- Format
-- File size
-- Sample rate
-- Number of channels (mono/stereo)
-- Duration
-- Number of samples
+### Информация о файле
+Кнопка **Info** показывает подробную информацию о выбранном в плейлисте треке:
+- Имя файла
+- Формат
+- Размер файла
+- Частота дискретизации
+- Количество каналов (моно/стерео)
+- Длительность
+- Количество сэмплов
 
-### User Interface (GUI Mode)
-- Modern GUI based on Fyne
-- Current time and total duration display
-- Progress bar with seek capability
-- Intuitive controls
+### Пользовательский интерфейс (GUI Mode)
+- Современный GUI на базе Fyne
+- Отображение текущего времени и общей длительности
+- Слайдер прогресса с возможностью перемотки
+- Интуитивное управление
+- Реальный спектр-анализатор (FFT), отображающий уровни по частотам
+- Иконка приложения и окна
 
-## Usage
+## Плейлист
+- Добавление нескольких файлов через диалог **Open** (множественный выбор)
+- Выбор трека одинарным кликом мыши (позиционирование)
+- Воспроизведение трека двойным кликом
+- Удаление выбранного трека клавишей **Delete** или кнопкой **Del**
+- Визуальная подсветка выбранного трека
 
-### Launch without parameters (GUI Mode)
+## Сохранение состояния
+При закрытии приложение сохраняет состояние во временный файл `%TEMP%\mplayer_state.json`:
+- список треков плейлиста;
+- текущий и выделенный трек;
+- последний путь к папке (для кнопки **Open**);
+- уровень громкости.
+
+При следующем запуске состояние восстанавливается (если не переданы аргументы командной строки).
+
+## Использование
+
+### Запуск без параметров (GUI Mode)
 ```bash
 .\mplayer.exe
 ```
 
-### Console Mode
+### Консольный режим
 ```bash
 .\mplayer.exe -console song.mp3
 .\mplayer.exe -console C:\Music
 .\mplayer.exe -console song1.mp3 song2.flac
 ```
 
-### Help
+### Справка
 ```bash
 .\mplayer.exe -help
 ```
 
-### Debug Mode
+### Режим отладки
 ```bash
 .\mplayer.exe -debug
 ```
-When launched with the `-debug` flag, a `debug.log` file is created with detailed player operation logs.
+При запуске с флагом `-debug` создаётся файл `debug.log` с подробными логами работы плеера.
 
-## Hotkeys (Console Mode)
+## Горячие клавиши (Console Mode)
 
-| Key | Action |
+| Клавиша | Действие |
 |---------|----------|
-| `p` | Pause / Resume |
-| `s` | Stop |
-| `n` | Next track |
-| `r` | Previous track |
-| `+` | Increase volume |
-| `-` | Decrease volume |
-| `←` | Seek backward (5 seconds) |
-| `→` | Seek forward (5 seconds) |
-| `x` / `q` / `Esc` | Exit |
-| `h` | Command help |
+| `p` | Пауза / Возобновление |
+| `s` | Остановка |
+| `n` | Следующий трек |
+| `r` | Предыдущий трек |
+| `+` | Увеличить громкость |
+| `-` | Уменьшить громкость |
+| `Left` | Перемотка назад (5 секунд) |
+| `Right` | Перемотка вперёд (5 секунд) |
+| `x` / `q` / `Esc` | Выход |
+| `h` | Справка по командам |
 
-## Controls (GUI Mode)
+## Управление (GUI Mode)
+1. Нажмите **Open** для выбора одного или нескольких файлов
+2. Используйте кнопки управления:
+   - **Play** - начать воспроизведение
+   - **Pause** - пауза
+   - **Stop** - остановка и возврат к началу
+   - **Info** - информация о выбранном треке
+   - **Del** - удалить выбранный трек из плейлиста
+3. Настройте громкость с помощью слайдера
+4. Перематывайте трек с помощью слайдера прогресса
 
-1. Click "Open Audio File" to select a file
-2. Use control buttons:
-   - **▶ Play** - start playback
-   - **⏸ Pause** - pause playback
-   - **⏹ Stop** - stop and rewind to beginning
-   - **ℹ Info** - show file information
-3. Adjust volume using the slider
-4. Seek through the track using the progress slider
+## Технические детали
 
-## Technical Details
+### Используемые библиотеки
+- **beep** - библиотека воспроизведения аудио с надёжной буферизацией
+- **Fyne** - кроссплатформенный GUI-фреймворк
+- **keyboard** - библиотека обработки клавиатурных событий
 
-### Libraries Used
-- **beep** - Audio playback library with robust buffering
-- **Fyne** - Cross-platform GUI framework
-- **keyboard** - Keyboard event handling library
+### Архитектурные преимущества
+- Использование библиотеки beep обеспечивает плавное воспроизведение без прерываний
+- Буфер 100 мс для стабильного аудио
+- Логарифмическая шкала громкости для естественного управления
+- Потокобезопасный дизайн с использованием sync.Mutex
+- Поддержка плейлиста с циклическим переключением треков
+- Реальный спектр-анализатор (FFT) для визуализации частот
 
-### Architecture Advantages
-- Using beep library ensures smooth playback without interruptions
-- 100ms buffer for stable audio
-- Logarithmic volume scale for natural control
-- Thread-safe design using sync.Mutex
-- Playlist support with cyclic track switching
-
-## Building
-
+## Сборка
 ```bash
 go build -o mplayer.exe -ldflags "-s -w"
 ```
 
-## System Requirements
+## Системные требования
+- Windows 10/11, Linux Ubuntu
+- Устройство воспроизведения аудио
 
-- Windows 10/11
-- Audio playback device
-
-## Licenses
-
-Used libraries are distributed under their respective licenses:
+## Лицензии
+Используемые библиотеки распространяются под своими лицензиями:
 - beep - MIT License
 - Fyne - BSD 3-Clause License
 - keyboard - MIT License
