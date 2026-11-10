@@ -288,11 +288,14 @@ type Player struct {
 	format        beep.Format
 	speakerInited bool
 	analyzer      *spectrumAnalyzer
+	outputRate    beep.SampleRate // fixed speaker rate; tracks are resampled to it
+	originalRate  beep.SampleRate // native track rate, used for duration math
 
 	// State
 	isPlaying      bool
 	volume         float64
 	volumeStreamer *effects.Volume
+	fader          *faderStreamer
 
 	// UI elements
 	trackLabel       *widget.Label
@@ -325,12 +328,17 @@ type Player struct {
 	onTrackEnd func()
 }
 
+// outputRate is the fixed speaker sample rate. Tracks with a different native
+// rate are resampled to it, so the speaker is never re-created between tracks.
+const outputRate = 48000
+
 // NewPlayer creates a new player
 func NewPlayer(window fyne.Window) *Player {
 	debugPrintf("Creating new player")
 	return &Player{
-		volume: 0.5,
-		window: window,
+		volume:     0.5,
+		window:     window,
+		outputRate: beep.SampleRate(outputRate),
 	}
 }
 
@@ -342,13 +350,15 @@ func (p *Player) SetVolume(volume float64) {
 
 	p.volume = volume
 	if p.volumeStreamer != nil {
-		// Convert linear volume to decibels for better control
+		// effects.Volume uses gain = Base^Volume. With Base 10 the exponent is
+		// dB/10, so map the 0..1 slider to a -20..0 dB range (20 dB dynamic
+		// range). 100% = 0 dB (no clipping), 0% = muted.
 		if volume <= 0 {
 			p.volumeStreamer.Silent = true
 		} else {
 			p.volumeStreamer.Silent = false
-			// Logarithmic volume scale
-			p.volumeStreamer.Volume = -5 + volume*5
+			p.volumeStreamer.Base = 10
+			p.volumeStreamer.Volume = (-20 + volume*20) / 10
 		}
 	}
 }
@@ -450,20 +460,27 @@ func (p *Player) Load(path string) error {
 		return fmt.Errorf("unsupported format: %s", ext)
 	}
 
-	// Initialize speaker if needed or if sample rate changed
-	if !p.speakerInited || p.sampleRate != format.SampleRate {
-		if p.speakerInited {
-			speaker.Close()
-		}
-
-		// Initialize speaker with 100ms buffer for smooth playback
-		err := speaker.Init(format.SampleRate, format.SampleRate.N(time.Millisecond*100))
+	// Initialize the speaker exactly once with a fixed output rate.
+	// Tracks with a different native rate are resampled below, so no
+	// speaker re-creation (and no click) happens between tracks.
+	if !p.speakerInited {
+		err := speaker.Init(p.outputRate, p.outputRate.N(time.Millisecond*100))
 		if err != nil {
 			debugPrintErr(err, "Error initializing speaker")
 			return fmt.Errorf("audio initialization error: %w", err)
 		}
 		p.speakerInited = true
-		p.sampleRate = format.SampleRate
+	}
+
+	// Resample to the fixed output rate when the track rate differs.
+	// Quality 10 = linear interpolation, which is transparent for playback.
+	if format.SampleRate != p.outputRate {
+		src := streamer
+		streamer = &resampleSeeker{
+			inner:     src,
+			resampler: beep.Resample(10, format.SampleRate, p.outputRate, src),
+			ratio:     float64(p.outputRate) / float64(format.SampleRate),
+		}
 	}
 
 	// Save state
@@ -471,10 +488,12 @@ func (p *Player) Load(path string) error {
 	p.format = format
 	p.filePath = path
 	p.fileFormat = ext
+	p.originalRate = format.SampleRate
 	p.totalSamples = streamer.Len()
 
-	// Calculate duration
-	duration := format.SampleRate.D(p.totalSamples).Seconds()
+	// Calculate duration. totalSamples is in output-rate samples (the
+	// streamer is resampled to the fixed output rate), so use outputRate.
+	duration := p.outputRate.D(p.totalSamples).Seconds()
 	debugPrintf("Track duration: %.2f seconds, format: %s, samples: %d, rate: %d Hz",
 		duration, p.fileFormat, p.totalSamples, format.SampleRate)
 
@@ -517,6 +536,12 @@ func (p *Player) stopPlayback() {
 	if p.ctrl != nil {
 		p.ctrl.Paused = true
 	}
+
+	// Remove all streamers from the speaker's mixer. A paused beep.Ctrl
+	// streams silence forever and is never drained, so without this the old
+	// track's streamer would stay in the mixer and keep mixing (silently)
+	// on top of the next track.
+	speaker.Clear()
 
 	if p.stopProgress != nil {
 		select {
@@ -577,7 +602,7 @@ func (p *Player) Stop() {
 
 	p.elapsedAtPause = 0
 
-	duration := p.sampleRate.D(p.totalSamples).Seconds()
+	duration := p.outputRate.D(p.totalSamples).Seconds()
 	if p.progressBar != nil {
 		fyne.Do(func() {
 			p.progressBar.Value = 0
@@ -611,16 +636,26 @@ func (p *Player) Play() {
 	// Create controller
 	p.ctrl = &beep.Ctrl{Streamer: p.streamer, Paused: false}
 
-	// Тап для реального анализа спектра: перехватывает сэмплы до передачи в динамик
-	an := newSpectrumAnalyzer(float64(p.format.SampleRate), p.format.NumChannels)
+	// Tap for real spectrum analysis: intercepts samples before the speaker.
+	// The tap sits AFTER resampling, so it must be built for the fixed
+	// output rate (48 kHz) — using the native track rate would skew all
+	// frequency bins for non-48 kHz tracks.
+	an := newSpectrumAnalyzer(float64(p.outputRate), p.format.NumChannels)
 	tap := &tapStreamer{inner: p.ctrl, an: an}
 	p.analyzer = an
 
-	// Create volume effect
+	// Fade-in removes the click at playback start and after a seek.
+	// ~15 ms at the output rate is inaudible but smooths the transition.
+	// The same length is used for the fade-out at track end.
+	fadeSamples := int(p.outputRate.N(15 * time.Millisecond))
+	p.fader = newFaderStreamer(tap, fadeSamples, p.totalSamples)
+
+	// Create volume effect. Base 10 means the exponent is dB/10, so the
+	// slider maps to a -20..0 dB range (100% = 0 dB, no clipping).
 	p.volumeStreamer = &effects.Volume{
-		Streamer: tap,
-		Base:     2,
-		Volume:   -5 + p.volume*5,
+		Streamer: p.fader,
+		Base:     10,
+		Volume:   (-20 + p.volume*20) / 10,
 		Silent:   p.volume <= 0,
 	}
 
@@ -658,14 +693,24 @@ func (p *Player) updateProgress() {
 				continue
 			}
 
-			// Calculate current position
-			elapsed := p.elapsedAtPause
-			if p.isPlaying {
-				elapsed += time.Since(p.startTime)
-			}
+			// Take a local reference to the streamer: Load() may swap
+			// p.streamer concurrently, and the old object is still safe to
+			// read from (its progress will be clamped by the new track's
+			// totalSamples on the next tick).
+			s := p.streamer
+			total := p.totalSamples
+			duration := p.outputRate.D(total).Seconds()
 
-			currentSeconds := elapsed.Seconds()
-			duration := p.sampleRate.D(p.totalSamples).Seconds()
+			// Calculate current position from the actual number of samples
+			// already consumed by the streamer. This is exact and does not
+			// drift when the audio driver or OS briefly stalls. Read it
+			// under the speaker lock, like Seek does, to avoid a race with
+			// the audio thread consuming samples.
+			speaker.Lock()
+			currentSamples := s.Position()
+			speaker.Unlock()
+
+			currentSeconds := p.outputRate.D(currentSamples).Seconds()
 			progress := currentSeconds / duration
 
 			if progress < 0 {
@@ -675,15 +720,38 @@ func (p *Player) updateProgress() {
 			if progress >= 1 {
 				progress = 1
 				currentSeconds = duration
+				// Capture the callback before releasing the lock.
+				cb := p.onTrackEnd
 				p.mu.Unlock()
 
-				// Track ended - call callback if exists
-				if p.onTrackEnd != nil {
-					p.onTrackEnd()
+				// Track ended. The callback must be invoked OUTSIDE the
+				// player lock: it calls Load/Play (console and GUI), which
+				// acquire the same mutex, and a non-reentrant sync.Mutex
+				// would deadlock here.
+				if cb != nil {
+					cb()
 				} else {
 					p.Stop()
 				}
-				continue
+
+				// The callback (or Stop) usually swaps p.streamer. If that
+				// happened, this tick's position was read from the OLD
+				// streamer — skip the UI update so a stale "full" progress
+				// is not rendered and a second onTrackEnd does not fire.
+				p.mu.Lock()
+				streamerSwapped := p.streamer != s
+				if !streamerSwapped {
+					// The position may have moved (e.g. the user seeked
+					// backward while the callback ran) — re-check it.
+					speaker.Lock()
+					stillAtEnd := s.Position() >= total
+					speaker.Unlock()
+					streamerSwapped = !stillAtEnd
+				}
+				if streamerSwapped {
+					p.mu.Unlock()
+					continue
+				}
 			}
 
 			// Update UI
@@ -717,7 +785,7 @@ func (p *Player) ShowInfo(parent fyne.Window) {
 		return
 	}
 
-	duration := p.sampleRate.D(p.totalSamples).Seconds()
+	duration := p.outputRate.D(p.totalSamples).Seconds()
 
 	// Format file size
 	var sizeStr string
@@ -752,7 +820,7 @@ Total samples: %d`,
 		fileName,
 		strings.ToUpper(p.fileFormat),
 		sizeStr,
-		p.sampleRate,
+		p.originalRate,
 		p.format.NumChannels,
 		p.formatTime(duration),
 		p.totalSamples,
@@ -900,10 +968,15 @@ func (p *Player) Seek(pos float64) {
 		return
 	}
 
-	duration := p.sampleRate.D(p.totalSamples).Seconds()
+	duration := p.outputRate.D(p.totalSamples).Seconds()
 	p.elapsedAtPause = time.Duration(pos * duration * float64(time.Second))
 	if p.isPlaying {
 		p.startTime = time.Now()
+		// Re-arm the fade so the jump to the new position is not a hard click.
+		if p.fader != nil {
+			p.fader.count = 0
+			p.fader.active = false
+		}
 	}
 
 	currentSeconds := pos * duration
@@ -1079,8 +1152,12 @@ func runConsoleMode(playlist *Playlist) {
 		case key == keyboard.KeyArrowLeft:
 			player.mu.Lock()
 			if player.streamer != nil && player.totalSamples > 0 {
+				// Read the position under the speaker lock to avoid a race
+				// with the audio thread consuming samples.
+				speaker.Lock()
 				currentPos := float64(player.streamer.Position()) / float64(player.totalSamples)
-				duration := player.sampleRate.D(player.totalSamples).Seconds()
+				speaker.Unlock()
+				duration := player.outputRate.D(player.totalSamples).Seconds()
 				newPos := currentPos - 5.0/duration
 				if newPos < 0 {
 					newPos = 0
@@ -1095,8 +1172,12 @@ func runConsoleMode(playlist *Playlist) {
 		case key == keyboard.KeyArrowRight:
 			player.mu.Lock()
 			if player.streamer != nil && player.totalSamples > 0 {
+				// Read the position under the speaker lock to avoid a race
+				// with the audio thread consuming samples.
+				speaker.Lock()
 				currentPos := float64(player.streamer.Position()) / float64(player.totalSamples)
-				duration := player.sampleRate.D(player.totalSamples).Seconds()
+				speaker.Unlock()
+				duration := player.outputRate.D(player.totalSamples).Seconds()
 				newPos := currentPos + 5.0/duration
 				if newPos > 1 {
 					newPos = 1
@@ -1598,6 +1679,102 @@ func (s *spectrumData) Draw(w, h int) image.Image {
 	}
 	return img
 }
+
+// resampleSeeker wraps a beep.Resampler and exposes StreamSeeker by
+// delegating to the underlying native-rate streamer, converting positions
+// between the output rate and the track's native rate.
+type resampleSeeker struct {
+	inner     beep.StreamSeeker // native-rate source
+	resampler *beep.Resampler
+	ratio     float64           // outputRate / nativeRate
+}
+
+func (r *resampleSeeker) Stream(samples [][2]float64) (n int, ok bool) {
+	return r.resampler.Stream(samples)
+}
+
+func (r *resampleSeeker) Err() error { return r.resampler.Err() }
+
+// Position returns the consumed position in output-rate samples.
+func (r *resampleSeeker) Position() int {
+	return int(float64(r.inner.Position()) * r.ratio)
+}
+
+// Len returns the total length in output-rate samples.
+func (r *resampleSeeker) Len() int {
+	return int(float64(r.inner.Len()) * r.ratio)
+}
+
+// Seek receives a position in output-rate samples and converts it to the
+// native rate before delegating to the source.
+func (r *resampleSeeker) Seek(samples int) error {
+	return r.inner.Seek(int(float64(samples) / r.ratio))
+}
+
+// ---------- Fade-in (убирает клики на старте и после перемотки) ----------
+
+// faderStreamer плавно поднимает громкость с нуля в течение первых
+// "активных" сэмплов и симметрично затухает до нуля в последних.
+// Пока поток отдаёт тишину (пауза), счётчик не растёт,
+// поэтому при возобновлении воспроизведения фейд повторяется.
+type faderStreamer struct {
+	inner  beep.Streamer
+	fadeN  int   // количество сэмплов для полного фейда
+	total  int   // общая длина потока в сэмплах (для fade-out)
+	count  int   // сколько активных сэмплов уже выдано
+	active bool  // идёт ли активный (не тишина) поток
+}
+
+// newFaderStreamer создаёт фейдер: fadeSamples — длительность фейда в сэмплах,
+// total — общая длина потока (0 отключает fade-out).
+func newFaderStreamer(inner beep.Streamer, fadeSamples, total int) *faderStreamer {
+	return &faderStreamer{inner: inner, fadeN: fadeSamples, total: total}
+}
+
+func (f *faderStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+	n, ok = f.inner.Stream(samples)
+	if n <= 0 {
+		return n, ok
+	}
+	// Silence detection: if the whole chunk is zero the stream is paused,
+	// so the fade counter must not advance.
+	silence := true
+	for i := 0; i < n; i++ {
+		if samples[i][0] != 0 || samples[i][1] != 0 {
+			silence = false
+			break
+		}
+	}
+	if silence {
+		f.active = false
+		return n, ok
+	}
+	if !f.active {
+		f.count = 0
+		f.active = true
+	}
+	// Apply a per-sample ramp so the fade is correct even when a chunk is
+	// larger than the fade length. The same ramp is mirrored at the end of
+	// the stream (fade-out) to avoid a hard cut on track end.
+	for i := 0; i < n; i++ {
+		gain := 1.0
+		if f.count < f.fadeN {
+			gain = float64(f.count) / float64(f.fadeN)
+		}
+		if f.total > 0 && f.count >= f.total-f.fadeN {
+			out := float64(f.total - 1 - f.count) / float64(f.fadeN)
+			if out < gain {
+				gain = out
+			}
+		}
+		samples[i][0] *= gain
+		samples[i][1] *= gain
+		f.count++
+	}
+	return n, ok
+}
+
+func (f *faderStreamer) Err() error { return f.inner.Err() }
 
 // ---------- Реальный анализ спектра (FFT) ----------
 
